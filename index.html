@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>台股市場廣度與融資維持率觀測站</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+    <!-- Apache ECharts CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- 頂部導覽列與控制列 -->
+        <header class="navbar">
+            <div class="brand">
+                <div class="logo-icon">📈</div>
+                <div class="brand-info">
+                    <h1>台股市場廣度儀表板</h1>
+                    <span class="subtitle">mofiinvestment.com / 資料同步至最新交易日</span>
+                </div>
+            </div>
+
+            <!-- 維持率門檻選擇器按鈕 -->
+            <div class="threshold-selector" id="thresholdSelector">
+                <span class="selector-label">融資維持率門檻：</span>
+                <button class="btn-threshold active" data-threshold="130">&lt; 130%</button>
+                <button class="btn-threshold" data-threshold="140">&lt; 140%</button>
+                <button class="btn-threshold" data-threshold="150">&lt; 150%</button>
+                <button class="btn-threshold" data-threshold="160">&lt; 160%</button>
+            </div>
+        </header>
+
+        <!-- 最新數據交易日狀態資訊條 + 快捷縮放按鈕列 -->
+        <div class="data-status-bar">
+            <div class="status-badge">
+                <span class="pulse-dot"></span>
+                <span class="status-label">最新交易日：</span>
+                <strong class="status-date" id="lblLatestDate">-----</strong>
+            </div>
+
+            <!-- 快捷縮放與移至最新按鈕組 -->
+            <div class="zoom-preset-group" id="zoomPresetGroup">
+                <button class="btn-zoom active" data-range="all">全部</button>
+                <button class="btn-zoom" data-range="6m">近 6 個月</button>
+                <button class="btn-zoom" data-range="3m">近 3 個月</button>
+                <button class="btn-zoom" data-range="1m">近 1 個月</button>
+                <button class="btn-zoom btn-latest" id="btnResetLatest">📍 移至最新</button>
+            </div>
+
+            <div class="status-info" id="lblDataSummary">
+                <span class="m-pill">加權指數 <strong>--</strong></span>
+                <span class="m-pill">&lt;130% <strong class="c-orange">-- 檔</strong></span>
+                <span class="m-pill">20MA <strong class="c-blue">--%</strong></span>
+                <span class="m-pill">60MA <strong class="c-purple">--%</strong></span>
+                <span class="m-pill">上市 <strong class="c-amber">--%</strong></span>
+                <span class="m-pill">上櫃 <strong class="c-green">--%</strong></span>
+            </div>
+        </div>
+
+        <!-- 圖表主要內容區 (連動 4 子圖) -->
+        <main class="chart-dashboard">
+            <!-- 子圖一：加權指數 TAIEX -->
+            <div class="chart-pane-wrapper">
+                <div class="pane-header">
+                    <span class="pane-title">加權指數 TAIEX</span>
+                    <span class="pane-value" id="valTaiex">--</span>
+                </div>
+                <div id="chartTaiex" class="chart-pane"></div>
+            </div>
+
+            <!-- 子圖二：低維持率家數 -->
+            <div class="chart-pane-wrapper">
+                <div class="pane-header">
+                    <span class="pane-title" id="titleMarginCount">融資維持率 &lt; 130% 家數</span>
+                    <span class="pane-value highlight-warning" id="valMarginCount">-- 檔</span>
+                </div>
+                <div id="chartMarginCount" class="chart-pane"></div>
+            </div>
+
+            <!-- 子圖三：市場廣度 (站上均線比例 %) -->
+            <div class="chart-pane-wrapper">
+                <div class="pane-header">
+                    <span class="pane-title">市場廣度：站上均線比例 %</span>
+                    <div class="legend-values">
+                        <span class="legend-tag ma20">20MA: <strong id="valMa20">--%</strong></span>
+                        <span class="legend-tag ma60">60MA: <strong id="valMa60">--%</strong></span>
+                    </div>
+                </div>
+                <div id="chartBreadth" class="chart-pane"></div>
+            </div>
+
+            <!-- 子圖四：大盤整體融資維持率 % -->
+            <div class="chart-pane-wrapper">
+                <div class="pane-header">
+                    <div class="title-with-toggles">
+                        <span class="pane-title">大盤整體融資維持率 %</span>
+                        <div class="toggle-group" id="btnGroupMarginType">
+                            <button class="btn-toggle active" data-type="all">全市場</button>
+                            <button class="btn-toggle" data-type="twse">上市</button>
+                            <button class="btn-toggle" data-type="tpex">上櫃</button>
+                        </div>
+                    </div>
+                    <span class="pane-value" id="valTotalMargin">--%</span>
+                </div>
+                <div id="chartTotalMargin" class="chart-pane"></div>
+            </div>
+        </main>
+    </div>
+
+    <!-- 備用數據腳本 (確保直接雙擊 file:// index.html 也能順暢顯示圖表) -->
+    <script src="data_fallback.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
