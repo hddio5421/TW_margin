@@ -47,7 +47,7 @@ flowchart LR
 | `data/processor_bootstrap.json` | 由歷史快取濃縮出的 60 日移動狀態。 |
 | `data/processing_manifest.json` | 計算版本、最新日期、筆數及原始資料完整度。 |
 | `data_fallback.js` | 主 CSV 的 JavaScript 內嵌副本，供 `file://` 開啟。 |
-| `.github/workflows/daily_update.yml` | 平日盤後更新、Git 提交及 GitHub Pages 部署。 |
+| `.github/workflows/daily_update.yml` | 平日盤後抓取、重算、Git 提交及推送；不直接執行 GitHub Pages 部署。 |
 
 根目錄的 `daily_market_breadth.csv` 現在是主 CSV 的相容性鏡像，欄位與內容必須完全一致。`data.json` 與 `data_fetcher.py` 是舊的模擬資料工具，現行網頁不會載入。
 
@@ -209,7 +209,11 @@ python backfill_history.py
 
 GitHub Actions 在星期一至星期五 UTC 13:45，也就是台灣時間 21:45 執行，並支援手動觸發。
 
-工作流程會執行 `fetch_real_data.py`，提交 `data/`、根目錄 CSV 與 `data_fallback.js`，再部署整個儲存庫根目錄至 GitHub Pages。baseline、bootstrap 與 raw journal 都位於 `data/`，因此 Actions 不需要未提交且被忽略的本機 `cache/`。
+`daily_update.yml` 只負責執行 `fetch_real_data.py`，並在資料有變動時提交及推送 `data/`、根目錄 CSV 與 `data_fallback.js`。baseline、bootstrap 與 raw journal 都位於 `data/`，因此 Actions 不需要未提交且被忽略的本機 `cache/`。
+
+GitHub Pages 使用儲存庫設定中的 `Deploy from a branch`，來源為 `main / (root)`。每日工作流程推送新提交後，GitHub 內建的 `pages build and deployment` 會自動發布網站；`daily_update.yml` 不再重複呼叫 `actions/configure-pages`、`actions/upload-pages-artifact` 或 `actions/deploy-pages`，也不需要 `pages: write` 與 `id-token: write` 權限。這個配置與其他同帳號專案一致，可避免分支部署與自訂 Actions 部署同時存在，造成資料更新成功但每日工作流程被部署工作標記為失敗。
+
+如果未來將 Pages 的 Source 改為 `GitHub Actions`，才需要重新建立自訂部署 job，並為 deployment job 設定 `environment: github-pages`；在目前的分支部署模式下不要加入該 job。
 
 ## 輸出保護與檢查
 
