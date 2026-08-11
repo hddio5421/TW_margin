@@ -43,21 +43,25 @@ CSV_HEADER = [
     "twse_margin_ratio", "tpex_margin_ratio"
 ]
 
-import time
-
-def fetch_json(url, retries=3):
+def fetch_json(url, retries=5):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*'
+    }
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(req, context=SSL_CTX) as response:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, context=SSL_CTX, timeout=15) as response:
                 content = response.read().decode('utf-8')
                 return json.loads(content)
         except Exception as e:
             if attempt < retries - 1:
-                print(f"    [Warning] {url} 讀取失敗: {e}, 正在重試 ({attempt+1}/{retries})...")
-                time.sleep(2)
+                wait_sec = 3 * (attempt + 1)
+                print(f"    [Warning] {url} 讀取失敗 ({e}), 正在重試 ({attempt+1}/{retries}) 於 {wait_sec} 秒後...")
+                time.sleep(wait_sec)
             else:
-                raise e
+                print(f"    [Notice] {url} 經過 {retries} 次重試後回應失敗: {e}")
+                return None
 
 def parse_float(val):
     try:
@@ -95,13 +99,17 @@ def process_and_update():
     twse_margin = fetch_json('https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN')
 
     print("[3/5] 抓取上市收盤價格...")
-    twse_price = fetch_json('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL')
+    twse_price = fetch_json('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL') or []
 
     print("[4/5] 抓取上櫃融資餘額...")
-    tpex_margin = fetch_json('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance')
+    tpex_margin = fetch_json('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance') or []
 
     print("[5/5] 抓取上櫃收盤價格...")
-    tpex_price = fetch_json('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes')
+    tpex_price = fetch_json('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes') or []
+
+    if not twse_margin and not tpex_margin:
+        print("\n[Notice] 官方 API 暫無可用數據或正進行伺服器維護，安全退出更新程序。")
+        sys.exit(0)
 
     # 精確判定融資實際交易日 (例如民國 1150806 -> 2026-08-06)
     if tpex_margin and isinstance(tpex_margin, list) and len(tpex_margin) > 0:
@@ -116,44 +124,48 @@ def process_and_update():
 
     # 3. 價格與維持率計算
     price_map = {}
-    for p in twse_price:
-        code = p.get('Code')
-        c_price = parse_float(p.get('ClosingPrice'))
-        if code and c_price > 0: price_map[code] = c_price
+    if twse_price and isinstance(twse_price, list):
+        for p in twse_price:
+            code = p.get('Code')
+            c_price = parse_float(p.get('ClosingPrice'))
+            if code and c_price > 0: price_map[code] = c_price
 
-    for p in tpex_price:
-        code = p.get('SecuritiesCompanyCode') or p.get('Code')
-        c_price = parse_float(p.get('Close') or p.get('ClosingPrice'))
-        if code and c_price > 0: price_map[code] = c_price
+    if tpex_price and isinstance(tpex_price, list):
+        for p in tpex_price:
+            code = p.get('SecuritiesCompanyCode') or p.get('Code')
+            c_price = parse_float(p.get('Close') or p.get('ClosingPrice'))
+            if code and c_price > 0: price_map[code] = c_price
 
     count_130, count_140, count_150, count_160 = 0, 0, 0, 0
 
-    for m in twse_margin:
-        code = m.get('股票代號') or m.get('Code')
-        margin_bal_shares = parse_float(m.get('融資今日餘額') or m.get('MarginPurchaseBalance'))
-        margin_bal_money = parse_float(m.get('融資前日餘額') or m.get('MarginPurchaseAmount'))
-        
-        if code in price_map and margin_bal_shares > 0:
-            curr_price = price_map[code]
-            market_val = curr_price * margin_bal_shares * 1000
-            ratio = (market_val / (margin_bal_money * 1000)) * 100 if margin_bal_money > 0 else 160.0
-                
-            if ratio < 130: count_130 += 1
-            if ratio < 140: count_140 += 1
-            if ratio < 150: count_150 += 1
-            if ratio < 160: count_160 += 1
-
-    for m in tpex_margin:
-        code = m.get('SecuritiesCompanyCode')
-        margin_bal_shares = parse_float(m.get('MarginPurchaseBalance'))
-        if code in price_map and margin_bal_shares > 0:
-            util_rate = parse_float(m.get('MarginPurchaseUtilizationRate'))
-            ratio = 165.0 - (util_rate * 25.0) if util_rate > 0 else 165.0
+    if twse_margin and isinstance(twse_margin, list):
+        for m in twse_margin:
+            code = m.get('股票代號') or m.get('Code')
+            margin_bal_shares = parse_float(m.get('融資今日餘額') or m.get('MarginPurchaseBalance'))
+            margin_bal_money = parse_float(m.get('融資前日餘額') or m.get('MarginPurchaseAmount'))
             
-            if ratio < 130: count_130 += 1
-            if ratio < 140: count_140 += 1
-            if ratio < 150: count_150 += 1
-            if ratio < 160: count_160 += 1
+            if code in price_map and margin_bal_shares > 0:
+                curr_price = price_map[code]
+                market_val = curr_price * margin_bal_shares * 1000
+                ratio = (market_val / (margin_bal_money * 1000)) * 100 if margin_bal_money > 0 else 160.0
+                    
+                if ratio < 130: count_130 += 1
+                if ratio < 140: count_140 += 1
+                if ratio < 150: count_150 += 1
+                if ratio < 160: count_160 += 1
+
+    if tpex_margin and isinstance(tpex_margin, list):
+        for m in tpex_margin:
+            code = m.get('SecuritiesCompanyCode')
+            margin_bal_shares = parse_float(m.get('MarginPurchaseBalance'))
+            if code in price_map and margin_bal_shares > 0:
+                util_rate = parse_float(m.get('MarginPurchaseUtilizationRate'))
+                ratio = 165.0 - (util_rate * 25.0) if util_rate > 0 else 165.0
+                
+                if ratio < 130: count_130 += 1
+                if ratio < 140: count_140 += 1
+                if ratio < 150: count_150 += 1
+                if ratio < 160: count_160 += 1
 
     # 防呆檢查：必須兩市融資 API 均非空，且成功抓取有效數據
     if not twse_margin or not tpex_margin or count_130 == 0:
