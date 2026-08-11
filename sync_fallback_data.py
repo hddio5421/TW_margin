@@ -4,10 +4,12 @@
 """
 
 import os
+import shutil
 
 BASE_DIR = os.path.dirname(__file__)
 CSV_PATH = os.path.join(BASE_DIR, "data", "daily_market_breadth.csv")
 FALLBACK_JS_PATH = os.path.join(BASE_DIR, "data_fallback.js")
+ROOT_CSV_PATH = os.path.join(BASE_DIR, "daily_market_breadth.csv")
 
 def update_fallback_js():
     if not os.path.exists(CSV_PATH):
@@ -23,6 +25,10 @@ def update_fallback_js():
 
     with open(csv_file, 'r', encoding='utf-8') as f:
         content = f.read()
+
+    # 根目錄 CSV 是相容性鏡像；不可再保留不同欄位或不同日期的舊資料。
+    if os.path.abspath(csv_file) != os.path.abspath(ROOT_CSV_PATH):
+        shutil.copyfile(csv_file, ROOT_CSV_PATH)
 
     js_content = f"window.FALLBACK_CSV = `{content}`;\n"
 

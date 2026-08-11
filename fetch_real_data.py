@@ -1,236 +1,316 @@
-"""
-台股真實資料自動抓取與處理腳本 (整合 TWSE 官方真實加權指數 FMTQIK)
+"""Download one official TWSE/TPEx trading day and rebuild dashboard data.
 
-資料來源：
-- 加權指數 TAIEX: https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK
-- 上市融資: https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN
-- 上市價格: https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL
-- 上櫃融資: https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance
-- 上櫃價格: https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes
+Both normal daily updates and missed-day backfills are normalized into
+``data/raw_market_daily.csv``. The shared processor then replays all raw days
+after the historical bootstrap, so calculation rules never change at the join.
 """
 
-import sys
+from __future__ import annotations
+
+import argparse
 import io
+import sys
+import time
+from datetime import date, datetime
+from typing import Dict, Iterable, List, Mapping, Optional
 
-if sys.platform == 'win32':
+import requests
+
+from market_pipeline import (
+    is_supported_stock,
+    parse_float,
+    rebuild_all_outputs,
+    rebuild_baseline_from_cache,
+    refresh_market_totals,
+    upsert_raw_day,
+)
+
+
+if sys.platform == "win32":
     try:
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
     except Exception:
         pass
 
-import json
-import ssl
-import urllib.request
-import os
-import csv
-from datetime import datetime
-from sync_fallback_data import update_fallback_js
 
-SSL_CTX = ssl.create_default_context()
-SSL_CTX.check_hostname = False
-SSL_CTX.verify_mode = ssl.CERT_NONE
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+}
 
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+TWSE_PRICE_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+TWSE_MARGIN_URL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
+TPEX_PRICE_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
+TPEX_MARGIN_URL = "https://www.tpex.org.tw/www/zh-tw/margin/balance"
+TPEX_LATEST_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance"
 
-BASE_DIR = os.path.dirname(__file__)
-DATA_ROOT = os.path.join(BASE_DIR, "data")
-MASTER_CSV = os.path.join(DATA_ROOT, "daily_market_breadth.csv")
 
-CSV_HEADER = [
-    "date", "taiex", "maint_130", "maint_140", "maint_150", 
-    "maint_160", "ma20_pct", "ma60_pct", "total_margin_ratio",
-    "twse_margin_ratio", "tpex_margin_ratio"
-]
-
-def fetch_json(url, retries=5):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*'
-    }
-    for attempt in range(retries):
+def fetch_json(url: str, params: Optional[dict] = None, retries: int = 5):
+    last_error = None
+    for attempt in range(1, retries + 1):
         try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, context=SSL_CTX, timeout=15) as response:
-                content = response.read().decode('utf-8')
-                return json.loads(content)
-        except Exception as e:
-            if attempt < retries - 1:
-                wait_sec = 3 * (attempt + 1)
-                print(f"    [Warning] {url} 讀取失敗 ({e}), 正在重試 ({attempt+1}/{retries}) 於 {wait_sec} 秒後...")
-                time.sleep(wait_sec)
-            else:
-                print(f"    [Notice] {url} 經過 {retries} 次重試後回應失敗: {e}")
-                return None
+            response = requests.get(url, params=params, headers=HEADERS, timeout=90)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt == retries:
+                break
+            wait_seconds = 3 * attempt
+            print(f"[Warning] {url} 讀取失敗，{wait_seconds} 秒後重試 ({attempt}/{retries})：{exc}")
+            time.sleep(wait_seconds)
+    raise RuntimeError(f"{url} 經過 {retries} 次重試仍失敗：{last_error}")
 
-def parse_float(val):
+
+def roc_compact_to_iso(value: str) -> str:
+    raw = str(value or "").strip().replace("/", "")
+    if len(raw) != 7 or not raw.isdigit():
+        raise ValueError(f"無法辨識民國日期：{value}")
+    return f"{int(raw[:3]) + 1911:04d}-{raw[3:5]}-{raw[5:7]}"
+
+
+def discover_latest_trade_date() -> str:
+    rows = fetch_json(TPEX_LATEST_URL)
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError("TPEx 最新融資 API 沒有資料")
+    dates = {
+        roc_compact_to_iso(row.get("Date"))
+        for row in rows
+        if isinstance(row, dict) and row.get("Date")
+    }
+    if len(dates) != 1:
+        raise RuntimeError(f"TPEx 最新融資 API 日期不一致：{sorted(dates)}")
+    return dates.pop()
+
+
+def _find_table(payload: Mapping, required_fields: Iterable[str], title_text: str = "") -> dict:
+    required = set(required_fields)
+    for table in payload.get("tables", []):
+        fields = set(table.get("fields", []))
+        title = str(table.get("title", ""))
+        if required.issubset(fields) and (not title_text or title_text in title):
+            return table
+    raise RuntimeError(f"找不到欄位 {sorted(required)} 的資料表")
+
+
+def _field_index(table: Mapping, field_name: str) -> int:
     try:
-        if isinstance(val, (int, float)):
-            return float(val)
-        cleaned = str(val).replace(',', '').strip()
-        return float(cleaned) if cleaned and cleaned != '--' else 0.0
-    except:
-        return 0.0
+        return list(table.get("fields", [])).index(field_name)
+    except ValueError as exc:
+        raise RuntimeError(f"資料表缺少欄位：{field_name}") from exc
 
-def process_and_update():
-    print("\n=========================================")
-    print("  台股真實加權指數 (44000+ 點位階) 與融資數據抓取  ")
-    print("=========================================")
-    today = datetime.now()
-    today_str = today.strftime("%Y-%m-%d")
-    year_str = today.strftime("%Y")
-    month_str = today.strftime("%m")
 
-    # 1. 抓取 TWSE 官方 FMTQIK (含真實加權指數 TAIEX)
-    real_taiex = 43360.66
+def _parse_twse_price(payload: Mapping) -> tuple[Dict[str, float], float]:
+    table = _find_table(payload, {"證券代號", "收盤價"}, "每日收盤行情")
+    code_index = _field_index(table, "證券代號")
+    close_index = _field_index(table, "收盤價")
+    prices = {}
+    for row in table.get("data", []):
+        code = str(row[code_index]).strip()
+        close = parse_float(row[close_index])
+        if is_supported_stock(code) and close > 0:
+            prices[code] = close
+
+    index_table = _find_table(payload, {"指數", "收盤指數"}, "價格指數")
+    name_index = _field_index(index_table, "指數")
+    value_index = _field_index(index_table, "收盤指數")
+    taiex = 0.0
+    for row in index_table.get("data", []):
+        if str(row[name_index]).strip() == "發行量加權股價指數":
+            taiex = parse_float(row[value_index])
+            break
+    if taiex <= 0:
+        raise RuntimeError("TWSE 資料中找不到有效的發行量加權股價指數")
+    return prices, taiex
+
+
+def _parse_twse_margin(payload: Mapping) -> Dict[str, float]:
+    table = None
+    for candidate in payload.get("tables", []):
+        if "融資融券彙總" in str(candidate.get("title", "")):
+            table = candidate
+            break
+    if table is None:
+        raise RuntimeError("TWSE 資料中找不到融資融券彙總表")
+
+    balances = {}
+    for row in table.get("data", []):
+        if len(row) < 7:
+            continue
+        code = str(row[0]).strip()
+        balance = parse_float(row[6])
+        if is_supported_stock(code):
+            balances[code] = balance
+    return balances
+
+
+def _parse_tpex_price(payload: Mapping) -> Dict[str, float]:
+    table = _find_table(payload, {"代號", "收盤"}, "上櫃股票行情")
+    code_index = _field_index(table, "代號")
+    close_index = _field_index(table, "收盤")
+    prices = {}
+    for row in table.get("data", []):
+        code = str(row[code_index]).strip()
+        close = parse_float(row[close_index])
+        if is_supported_stock(code) and close > 0:
+            prices[code] = close
+    return prices
+
+
+def _parse_tpex_margin(payload: Mapping) -> Dict[str, float]:
+    table = _find_table(payload, {"代號", "資餘額"}, "融資融券餘額")
+    code_index = _field_index(table, "代號")
+    balance_index = _field_index(table, "資餘額")
+    balances = {}
+    for row in table.get("data", []):
+        code = str(row[code_index]).strip()
+        balance = parse_float(row[balance_index])
+        if is_supported_stock(code):
+            balances[code] = balance
+    return balances
+
+
+def _validate_response_date(payload: Mapping, expected: str, source: str) -> None:
+    raw = str(payload.get("date", "")).replace("-", "").replace("/", "")
+    expected_compact = expected.replace("-", "")
+    if raw != expected_compact:
+        raise RuntimeError(f"{source} 回傳日期 {raw or '(空白)'}，預期 {expected_compact}")
+    stat = str(payload.get("stat", "")).lower()
+    if stat not in {"ok"}:
+        raise RuntimeError(f"{source} 回傳狀態不是 OK：{payload.get('stat')}")
+
+
+def fetch_official_day(trade_date: str) -> tuple[float, List[dict]]:
+    parsed = datetime.strptime(trade_date, "%Y-%m-%d").date()
+    compact = parsed.strftime("%Y%m%d")
+    slash_date = parsed.strftime("%Y/%m/%d")
+
+    print(f"下載 {trade_date} TWSE 收盤行情與融資餘額...")
+    twse_price_payload = fetch_json(
+        TWSE_PRICE_URL,
+        {"date": compact, "type": "ALLBUT0999", "response": "json"},
+    )
+    twse_margin_payload = fetch_json(
+        TWSE_MARGIN_URL,
+        {"date": compact, "selectType": "ALL", "response": "json"},
+    )
+
+    print(f"下載 {trade_date} TPEx 收盤行情與融資餘額...")
+    tpex_price_payload = fetch_json(
+        TPEX_PRICE_URL,
+        {"date": slash_date, "id": "", "response": "json"},
+    )
+    tpex_margin_payload = fetch_json(
+        TPEX_MARGIN_URL,
+        {"date": slash_date, "id": "", "response": "json"},
+    )
+
+    for payload, source in (
+        (twse_price_payload, "TWSE 收盤"),
+        (twse_margin_payload, "TWSE 融資"),
+        (tpex_price_payload, "TPEx 收盤"),
+        (tpex_margin_payload, "TPEx 融資"),
+    ):
+        _validate_response_date(payload, trade_date, source)
+
+    twse_prices, taiex = _parse_twse_price(twse_price_payload)
+    twse_margins = _parse_twse_margin(twse_margin_payload)
+    tpex_prices = _parse_tpex_price(tpex_price_payload)
+    tpex_margins = _parse_tpex_margin(tpex_margin_payload)
+
+    if len(twse_prices) < 700 or len(twse_margins) < 700:
+        raise RuntimeError(
+            f"TWSE 資料不完整：prices={len(twse_prices)}, margins={len(twse_margins)}"
+        )
+    if len(tpex_prices) < 500 or len(tpex_margins) < 500:
+        raise RuntimeError(
+            f"TPEx 資料不完整：prices={len(tpex_prices)}, margins={len(tpex_margins)}"
+        )
+
+    normalized = []
+    for market, prices, margins in (
+        ("twse", twse_prices, twse_margins),
+        ("tpex", tpex_prices, tpex_margins),
+    ):
+        for stock_id in sorted(set(prices) | set(margins)):
+            normalized.append(
+                {
+                    "stock_id": stock_id,
+                    "market": market,
+                    "close": prices.get(stock_id, 0.0),
+                    "margin_balance": margins.get(stock_id, 0.0),
+                }
+            )
+
+    print(
+        f"官方資料驗證完成：TAIEX={taiex:,.2f}, TWSE={len(twse_prices)} 檔, "
+        f"TPEx={len(tpex_prices)} 檔"
+    )
+    return taiex, normalized
+
+
+def process_and_update(target_date: Optional[str] = None) -> List:
+    trade_date = target_date or discover_latest_trade_date()
+    datetime.strptime(trade_date, "%Y-%m-%d")
+    print("=" * 58)
+    print(f"台股原始資料標準化與共用後處理：{trade_date}")
+    print("=" * 58)
+
+    taiex, stock_rows = fetch_official_day(trade_date)
+    # No project file is changed until all four official datasets pass validation.
+    upsert_raw_day(trade_date, taiex, stock_rows)
+    totals = refresh_market_totals()
+    if trade_date not in totals:
+        raise RuntimeError(f"FinMind 尚未提供 {trade_date} 的市場融資金額")
+    rows = rebuild_all_outputs()
+    latest = rows[-1]
+    if latest[0] < trade_date:
+        raise RuntimeError(f"處理後資料只到 {latest[0]}，未到目標日期 {trade_date}")
+    return latest
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="下載官方盤後資料；可指定日期回補，並以共用公式重算後續資料。"
+    )
+    parser.add_argument(
+        "--date",
+        dest="trade_date",
+        metavar="YYYY-MM-DD",
+        help="指定要下載或回補的交易日；省略時自動使用最新交易日。",
+    )
+    parser.add_argument(
+        "--rebuild-only",
+        action="store_true",
+        help="不下載資料，只重播既有原始日誌並重建所有輸出。",
+    )
+    parser.add_argument(
+        "--rebuild-baseline",
+        action="store_true",
+        help="從既有 FinMind 快取重建歷史基準，再重播所有官方原始日誌。",
+    )
+    args = parser.parse_args()
+
     try:
-        print("[1/5] 正在從證交所抓取真實加權指數 (TAIEX)...")
-        fmtqik_data = fetch_json('https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK')
-        if fmtqik_data and len(fmtqik_data) > 0:
-            latest_entry = fmtqik_data[-1]
-            real_taiex = parse_float(latest_entry.get('TAIEX') or latest_entry.get('taiex'))
-            if real_taiex <= 0: real_taiex = 43360.66
-            print(f" -> 官方即時加權指數 TAIEX: {real_taiex:,} 點")
-    except Exception as e:
-        print(" -> 加權指數擷取微調:", e)
+        if args.rebuild_baseline:
+            latest = rebuild_baseline_from_cache()[-1]
+        elif args.rebuild_only:
+            latest = rebuild_all_outputs()[-1]
+        else:
+            latest = process_and_update(args.trade_date)
+        print(
+            f"完成：{latest[0]} TAIEX={float(latest[1]):,.2f}, "
+            f"<130%={latest[2]} 檔"
+        )
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
 
-    # 2. 抓取上市櫃融資與行情
-    print("[2/5] 抓取上市融資餘額...")
-    twse_margin = fetch_json('https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN')
-
-    print("[3/5] 抓取上市收盤價格...")
-    twse_price = fetch_json('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL') or []
-
-    print("[4/5] 抓取上櫃融資餘額...")
-    tpex_margin = fetch_json('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance') or []
-
-    print("[5/5] 抓取上櫃收盤價格...")
-    tpex_price = fetch_json('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes') or []
-
-    if not twse_margin and not tpex_margin:
-        print("\n[Notice] 官方 API 暫無可用數據或正進行伺服器維護，安全退出更新程序。")
-        sys.exit(0)
-
-    # 精確判定融資實際交易日 (例如民國 1150806 -> 2026-08-06)
-    if tpex_margin and isinstance(tpex_margin, list) and len(tpex_margin) > 0:
-        raw_d = str(tpex_margin[0].get('Date', '')).strip()
-        if len(raw_d) == 7 and raw_d.isdigit():
-            y = int(raw_d[:3]) + 1911
-            m = raw_d[3:5]
-            d = raw_d[5:7]
-            today_str = f"{y}-{m}-{d}"
-            year_str = str(y)
-            month_str = m
-
-    # 3. 價格與維持率計算
-    price_map = {}
-    if twse_price and isinstance(twse_price, list):
-        for p in twse_price:
-            code = p.get('Code')
-            c_price = parse_float(p.get('ClosingPrice'))
-            if code and c_price > 0: price_map[code] = c_price
-
-    if tpex_price and isinstance(tpex_price, list):
-        for p in tpex_price:
-            code = p.get('SecuritiesCompanyCode') or p.get('Code')
-            c_price = parse_float(p.get('Close') or p.get('ClosingPrice'))
-            if code and c_price > 0: price_map[code] = c_price
-
-    count_130, count_140, count_150, count_160 = 0, 0, 0, 0
-
-    if twse_margin and isinstance(twse_margin, list):
-        for m in twse_margin:
-            code = m.get('股票代號') or m.get('Code')
-            margin_bal_shares = parse_float(m.get('融資今日餘額') or m.get('MarginPurchaseBalance'))
-            margin_bal_money = parse_float(m.get('融資前日餘額') or m.get('MarginPurchaseAmount'))
-            
-            if code in price_map and margin_bal_shares > 0:
-                curr_price = price_map[code]
-                market_val = curr_price * margin_bal_shares * 1000
-                ratio = (market_val / (margin_bal_money * 1000)) * 100 if margin_bal_money > 0 else 160.0
-                    
-                if ratio < 130: count_130 += 1
-                if ratio < 140: count_140 += 1
-                if ratio < 150: count_150 += 1
-                if ratio < 160: count_160 += 1
-
-    if tpex_margin and isinstance(tpex_margin, list):
-        for m in tpex_margin:
-            code = m.get('SecuritiesCompanyCode')
-            margin_bal_shares = parse_float(m.get('MarginPurchaseBalance'))
-            if code in price_map and margin_bal_shares > 0:
-                util_rate = parse_float(m.get('MarginPurchaseUtilizationRate'))
-                ratio = 165.0 - (util_rate * 25.0) if util_rate > 0 else 165.0
-                
-                if ratio < 130: count_130 += 1
-                if ratio < 140: count_140 += 1
-                if ratio < 150: count_150 += 1
-                if ratio < 160: count_160 += 1
-
-    # 防呆檢查：必須兩市融資 API 均非空，且成功抓取有效數據
-    if not twse_margin or not tpex_margin or count_130 == 0:
-        print("\n[防呆攔截] 官方本日融資數據尚未正式發布（或資料不完整），已安全跳過寫入。")
-        print(" -> 請待今晚 21:30 證交所與櫃買中心正式匯入後再執行更新。")
-        return
-
-    new_row = [
-        today_str,
-        real_taiex,
-        count_130, count_140, count_150, count_160,
-        56.8, 62.4, 186.5, 188.4, 183.5
-    ]
-
-    # 4. 寫入當月與總表
-    month_dir = os.path.join(DATA_ROOT, year_str, month_str)
-    os.makedirs(month_dir, exist_ok=True)
-    month_csv = os.path.join(month_dir, f"market_breadth_{year_str}-{month_str}.csv")
-
-    existing_month_dates = set()
-    if os.path.exists(month_csv):
-        with open(month_csv, 'r', encoding='utf-8') as mf:
-            r = csv.reader(mf)
-            next(r, None)
-            for r_row in r:
-                if r_row: existing_month_dates.add(r_row[0])
-    else:
-        with open(month_csv, 'w', newline='', encoding='utf-8') as mf:
-            w = csv.writer(mf)
-            w.writerow(CSV_HEADER)
-
-    if today_str not in existing_month_dates:
-        with open(month_csv, 'a', newline='', encoding='utf-8') as mf:
-            w = csv.writer(mf)
-            w.writerow(new_row)
-
-    master_dates = set()
-    if os.path.exists(MASTER_CSV):
-        with open(MASTER_CSV, 'r', encoding='utf-8') as mf:
-            r = csv.reader(mf)
-            next(r, None)
-            for r_row in r:
-                if r_row: master_dates.add(r_row[0])
-
-    if today_str not in master_dates:
-        with open(MASTER_CSV, 'a', newline='', encoding='utf-8') as mf:
-            w = csv.writer(mf)
-            w.writerow(new_row)
-
-    update_fallback_js()
-
-    print("\n=========================================")
-    print("  【數據對接與更新流程執行完成！】最新資料顯示如下：")
-    print("=========================================")
-    try:
-        with open(MASTER_CSV, 'r', encoding='utf-8') as f:
-            r = list(csv.reader(f))
-            latest = r[-1]
-            print(f"  [資料庫最新交易日]: {latest[0]}")
-            print(f"  [當日加權指數]:    {float(latest[1]):,.1f} 點")
-            print(f"  [上市融資維持率]:  {latest[9]}%")
-            print(f"  [上櫃融資維持率]:  {latest[10]}%")
-    except Exception as e:
-        print(f"  SUCCESS: 成功對接 TWSE 官方指數 {real_taiex:,} 點！")
-    print("=========================================")
 
 if __name__ == "__main__":
-    process_and_update()
+    raise SystemExit(main())
