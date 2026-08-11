@@ -32,7 +32,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     for (const path of possiblePaths) {
         try {
-            const response = await fetch(path);
+            const cacheBuster = '?v=' + Date.now();
+            const response = await fetch(path + cacheBuster);
             if (response.ok) {
                 csvText = await response.text();
                 break;
